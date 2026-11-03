@@ -12,7 +12,7 @@ import org.bytedeco.javacpp.DoublePointer;
 
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferByte;
-import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 import static org.bytedeco.ffmpeg.global.avcodec.*;
 import static org.bytedeco.ffmpeg.global.avutil.*;
@@ -24,6 +24,19 @@ import static org.bytedeco.ffmpeg.global.swscale.*;
  * Thread-safe değildir; her decode işlemi için ayrı örnek kullan.
  */
 public final class PacketDecoder implements AutoCloseable {
+
+    /** Decoder'dan çıkan her frame için çağrılır. */
+    @FunctionalInterface
+    public interface FrameHandler {
+        /**
+         * @param pts   frame'in PTS'i (gösterim zamanı)
+         * @param dts   frame'in geldiği paketin DTS'i
+         * @param image resmi üretir; sadece bu çağrı sırasında geçerlidir.
+         *              Çağrılmazsa BGR dönüşümü hiç yapılmaz (ucuz atlama).
+         * @return decode'a devam edilsin mi; false dönerse durulur
+         */
+        boolean onFrame(long pts, long dts, Supplier<BufferedImage> image);
+    }
 
     private final AVCodecContext ctx;
     private final AVFrame frame = av_frame_alloc();
@@ -43,23 +56,32 @@ public final class PacketDecoder implements AutoCloseable {
         check(avcodec_open2(ctx, codec, (AVDictionary) null), "avcodec_open2");
     }
 
-    /** Paketi decoder'a verir; çıkan her frame için out çağrılır (0, 1 veya daha fazla kez). */
-    public void decode(AVPacket pkt, Consumer<BufferedImage> out) {
+    /**
+     * Paketi decoder'a verir; çıkan her frame için handler çağrılır (0, 1 veya daha fazla kez).
+     *
+     * @return handler durmak istediyse false
+     */
+    public boolean decode(AVPacket pkt, FrameHandler handler) {
         int r = avcodec_send_packet(ctx, pkt);
-        if (r < 0 && r != AVERROR_EAGAIN()) {
-            return; // bozuk paketi atla
+        if (r < 0 && r != AVERROR_EAGAIN() && r != AVERROR_EOF()) {
+            return true; // bozuk paketi atla
         }
         while (true) {
             r = avcodec_receive_frame(ctx, frame);
-            if (r < 0) break; // EAGAIN: daha fazla paket lazım, EOF: bitti
-            out.accept(toImage(frame));
-            av_frame_unref(frame);
+            if (r < 0) return true; // EAGAIN: daha fazla paket lazım, EOF: bitti
+            try {
+                long pts = frame.best_effort_timestamp();
+                long dts = frame.pkt_dts();
+                if (!handler.onFrame(pts, dts, () -> toImage(frame))) return false;
+            } finally {
+                av_frame_unref(frame);
+            }
         }
     }
 
     /** Decoder'ın içinde bekleyen son frame'leri de çıkarır. Son paketten sonra çağır. */
-    public void flush(Consumer<BufferedImage> out) {
-        decode(null, out);
+    public boolean flush(FrameHandler handler) {
+        return decode(null, handler);
     }
 
     private BufferedImage toImage(AVFrame f) {

@@ -7,17 +7,28 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.bytedeco.ffmpeg.global.avcodec.*;
+import static org.bytedeco.ffmpeg.global.avutil.AV_NOPTS_VALUE;
 
 /**
- * Son N video paketini RAM'de tutan dairesel tampon.
+ * Son N video paketini RAM'de tutan dairesel tampon. Sadece video paketleri eklenmelidir.
  *
  * Buffer her zaman bir keyframe ile başlar; böylece içerik her an decode edilebilir.
  * Bu yüzden eski paketler GOP (keyframe'den keyframe'e) bazında silinir ve
  * buffer'daki frame sayısı kısa süreliğine N'nin altına düşebilir.
  *
- * Thread-safe'tir: bir thread add() yaparken diğerleri snapshot() alabilir.
+ * Thread-safe'tir: bir thread add() yaparken diğerleri snapshot alabilir.
  */
 public final class PacketRingBuffer implements AutoCloseable {
+
+    /**
+     * DTS sorgusu için decode edilmesi gereken paketler.
+     *
+     * @param packets   hedef frame'in GOP'u: keyframe'den bir sonraki keyframe'e kadar
+     *                  (B-frame yeniden sıralaması için hedeften sonraki paketler de dahil)
+     * @param targetDts seçilen paketin DTS'i
+     * @param targetPts seçilen paketin PTS'i
+     */
+    public record GopSlice(List<AVPacket> packets, long targetDts, long targetPts) {}
 
     private final int capacity;
     private final ArrayDeque<AVPacket> packets = new ArrayDeque<>();
@@ -30,6 +41,7 @@ public final class PacketRingBuffer implements AutoCloseable {
 
     /** Paketin bir kopyasını ekler. Orijinal paket çağırana aittir. */
     public synchronized void add(AVPacket pkt) {
+        if (pkt.size() <= 0) return;
         boolean key = isKey(pkt);
 
         // Buffer boşken keyframe gelene kadar bekle (decode edilemeyen paket tutma)
@@ -69,6 +81,56 @@ public final class PacketRingBuffer implements AutoCloseable {
             if (isKey(p)) break;
         }
         return list;
+    }
+
+    /**
+     * Verilen DTS'e en yakın paketi bulur ve onu decode etmek için gereken GOP'u döner.
+     * Eşit uzaklıkta iki paket varsa eskisi seçilir. Buffer boşsa (veya hiçbir pakette
+     * DTS yoksa) null döner.
+     */
+    public synchronized GopSlice snapshotNearestDts(long dts) {
+        AVPacket[] arr = packets.toArray(new AVPacket[0]);
+
+        int best = -1;
+        long bestDiff = Long.MAX_VALUE;
+        for (int i = 0; i < arr.length; i++) {
+            long d = arr[i].dts();
+            if (d == AV_NOPTS_VALUE) continue;
+            long diff = Math.abs(d - dts);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                best = i;
+            } else if (d > dts) {
+                break; // DTS monoton artar; uzaklaşmaya başladıysak daha iyisi yok
+            }
+        }
+        if (best < 0) return null;
+
+        int start = best;
+        while (start > 0 && !isKey(arr[start])) start--;
+
+        int end = best + 1;
+        while (end < arr.length && !isKey(arr[end])) end++;
+
+        List<AVPacket> list = new ArrayList<>(end - start);
+        for (int i = start; i < end; i++) list.add(av_packet_clone(arr[i]));
+        return new GopSlice(list, arr[best].dts(), arr[best].pts());
+    }
+
+    /** Buffer'daki en eski DTS; yoksa {@link Long#MIN_VALUE}. */
+    public synchronized long oldestDts() {
+        for (AVPacket p : packets) if (p.dts() != AV_NOPTS_VALUE) return p.dts();
+        return Long.MIN_VALUE;
+    }
+
+    /** Buffer'daki en yeni DTS; yoksa {@link Long#MIN_VALUE}. */
+    public synchronized long newestDts() {
+        var it = packets.descendingIterator();
+        while (it.hasNext()) {
+            AVPacket p = it.next();
+            if (p.dts() != AV_NOPTS_VALUE) return p.dts();
+        }
+        return Long.MIN_VALUE;
     }
 
     public static void release(List<AVPacket> list) {

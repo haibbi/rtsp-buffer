@@ -14,10 +14,11 @@ import java.time.format.DateTimeFormatter;
  *   mvn -q compile exec:java -Dexec.args="rtsp://kullanici:sifre@192.168.1.10:554/stream 150"
  *
  * Komutlar (konsola yazıp ENTER):
- *   s     → durum bilgisi
- *   l     → en son frame'i JPEG olarak kaydet
- *   a     → buffer'daki tüm frame'leri JPEG olarak kaydet
- *   q     → çıkış
+ *   s         → durum bilgisi ve buffer'daki DTS aralığı
+ *   l         → en son frame'i JPEG olarak kaydet
+ *   d <dts>   → verilen DTS'e en yakın frame'i JPEG olarak kaydet
+ *   a         → buffer'daki tüm frame'leri JPEG olarak kaydet
+ *   q         → çıkış
  */
 public class Main {
 
@@ -31,17 +32,22 @@ public class Main {
 
         try (RtspPacketBuffer rtsp = new RtspPacketBuffer(url, frames)) {
             rtsp.start();
-            System.out.println("Komutlar: s=durum, l=son frame, a=tüm buffer, q=çıkış");
+            System.out.println("Komutlar: s=durum, l=son frame, d <dts>=DTS'e göre frame, a=tüm buffer, q=çıkış");
 
             BufferedReader in = new BufferedReader(new InputStreamReader(System.in));
             String line;
             while ((line = in.readLine()) != null) {
-                switch (line.trim()) {
+                String[] cmd = line.trim().split("\\s+");
+                switch (cmd[0]) {
                     case "s" -> printStatus(rtsp);
                     case "l" -> saveLatest(rtsp);
+                    case "d" -> {
+                        if (cmd.length < 2) { System.out.println("Kullanım: d <dts>"); break; }
+                        saveAtDts(rtsp, Long.parseLong(cmd[1]));
+                    }
                     case "a" -> saveAll(rtsp);
                     case "q" -> { return; }
-                    default -> System.out.println("Komutlar: s, l, a, q");
+                    default -> System.out.println("Komutlar: s, l, d <dts>, a, q");
                 }
             }
         }
@@ -54,6 +60,12 @@ public class Main {
                 r.isConnected(), r.width(), r.height(), r.fps(),
                 r.bufferedFrames(), r.capacity(), r.bufferedBytes() / 1e6,
                 rawPerFrame * r.bufferedFrames() / 1e6, r.receivedPackets());
+        long oldest = r.oldestDts(), newest = r.newestDts();
+        if (oldest != Long.MIN_VALUE) {
+            System.out.printf("DTS aralığı: %d … %d (time_base %d/%d, %.2f sn)%n",
+                    oldest, newest, r.timeBaseNum(), r.timeBaseDen(),
+                    (r.dtsToMillis(newest) - r.dtsToMillis(oldest)) / 1000.0);
+        }
     }
 
     private static void saveLatest(RtspPacketBuffer r) throws IOException {
@@ -63,6 +75,17 @@ public class Main {
         File f = new File("latest_" + stamp() + ".jpg");
         ImageIO.write(img, "jpg", f);
         System.out.printf("Kaydedildi: %s (%d ms)%n", f.getAbsolutePath(), (System.nanoTime() - t) / 1_000_000);
+    }
+
+    private static void saveAtDts(RtspPacketBuffer r, long dts) throws IOException {
+        long t = System.nanoTime();
+        TimedImage ti = r.imageAtDts(dts);
+        if (ti == null) { System.out.println("Buffer henüz boş."); return; }
+        File f = new File("dts_" + ti.dts() + ".jpg");
+        ImageIO.write(ti.image(), "jpg", f);
+        System.out.printf("%s eşleşme: istenen=%d, seçilen=%d (fark %+.1f ms) → %s (%d ms)%n",
+                ti.exactMatch() ? "Tam" : "En yakın", dts, ti.dts(), ti.deltaMillis(),
+                f.getAbsolutePath(), (System.nanoTime() - t) / 1_000_000);
     }
 
     private static void saveAll(RtspPacketBuffer r) {
